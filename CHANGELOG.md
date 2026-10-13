@@ -9,6 +9,7 @@ Changelog
 - Write whole sectors only: the partition entry array is written in a single write and the reserved bytes that follow the GPT header in its sector are now zeroed, as required by UEFI (#137)
 - Fix `GPTHeader::read_from` and `GPTPartitionEntry::read_from` reading more bytes than the 92 and 128 bytes they need, which made them fail on a reader of the exact size (regression of #144)
 - Read whole sectors only: `GPT::read_from` and `GPT::find_from` read the sector of the GPT header and the partition entry array in a single read each, so they work on devices that refuse to read partial sectors
+- `GPT::find_from` now also tries a sector size of 4096 when reading with a sector size of 512 fails with an I/O error, and returns that I/O error if both attempts fail
 
 ## v3.1.1 (2026-04-28)
 

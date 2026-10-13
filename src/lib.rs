@@ -794,6 +794,13 @@ impl GPT {
     /// size of 512 but if it fails it will automatically try to read the GPT using a sector size
     /// of 4096.
     ///
+    /// # Implementation notes
+    ///
+    /// The second attempt is made if no GPT has been found with a sector size of 512, or if the
+    /// reader returned an I/O error, because a disk with sectors of 4096 bytes may refuse to read
+    /// 512 bytes. In the latter case, the I/O error is the one returned if the second attempt
+    /// fails too.
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -814,8 +821,17 @@ impl GPT {
     {
         use self::Error::*;
 
+        fn is_io(err: &Error) -> bool {
+            match err {
+                Io(_) => true,
+                ReadError(primary_err, backup_err) => is_io(primary_err) && is_io(backup_err),
+                _ => false,
+            }
+        }
+
         Self::read_from(&mut reader, 512).or_else(|err_at_512| match err_at_512 {
             InvalidSignature => Self::read_from(&mut reader, 4096),
+            err if is_io(&err) => Self::read_from(&mut reader, 4096).map_err(|_| err),
             err => Err(err),
         })
     }
@@ -1623,6 +1639,40 @@ mod test {
 
         let mut reader = WholeSectors::new(fs::read(DISK1).unwrap(), 512);
         assert_eq!(GPT::find_from(&mut reader).unwrap().sector_size, 512);
+    }
+
+    #[test]
+    fn find_from_reader_refusing_sector_size_512() {
+        let mut reader = WholeSectors::new(fs::read(DISK2).unwrap(), 4096);
+        assert!(matches!(
+            GPT::read_from(&mut reader, 512).unwrap_err(),
+            Error::ReadError(..)
+        ));
+        assert_eq!(GPT::find_from(&mut reader).unwrap().sector_size, 4096);
+
+        // no GPT with a sector size of 4096 either: the error is the first one
+        let mut reader = WholeSectors::new(vec![0; 100 * 4096], 4096);
+        assert!(matches!(
+            GPT::read_from(&mut reader, 4096).unwrap_err(),
+            Error::InvalidSignature
+        ));
+        match GPT::find_from(&mut reader).unwrap_err() {
+            Error::ReadError(primary_err, backup_err) => {
+                assert!(matches!(*primary_err, Error::Io(_)));
+                assert!(matches!(*backup_err, Error::Io(_)));
+            }
+            err => panic!("unexpected error: {err}"),
+        }
+
+        // an error that is not an I/O error is returned as is
+        let mut data = fs::read(DISK1).unwrap();
+        data[512 + 16] ^= 0xff;
+        let len = data.len();
+        data[len - 512 + 16] ^= 0xff;
+        assert!(matches!(
+            GPT::find_from(&mut io::Cursor::new(data)).unwrap_err(),
+            Error::ReadError(..)
+        ));
     }
 
     #[test]
