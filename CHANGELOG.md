@@ -20,12 +20,15 @@ Changed:
 - Remove the `crc` dependency; the CRC-32 the specification requires is computed by a private module. Other than the optional `nix` feature, `gptman` has no dependencies left (#149)
 - `PartitionName` is 72 bytes, the size of the name field of a partition entry, and `GPTPartitionEntry` is 128 bytes, the size the specification gives it, against 96 and 152 before: a 128-entry table takes 16 KiB instead of 19 KiB (#150)
 - Remove the `homepage` field of `Cargo.toml`, which held the same URL as `repository`, where cargo warns about it since 1.101 (#150)
+- Write whole sectors only: the partition entry array is written in a single write and the reserved bytes that follow the GPT header in its sector are now zeroed, as required by UEFI (#137)
 
 Added:
 
 - `GPTHeader::from_bytes`/`to_bytes` over `&[u8; 92]`, `GPTPartitionEntry::from_bytes`/`to_bytes` over `&[u8; 128]` and `PartitionName::from_bytes`/`to_bytes` over `&[u8; 72]` (#149)
 - `Error::InvalidPartitionEntrySize`, `Error::InvalidPartitionEntryArraySize` and `Error::InvalidPartitionEntryCount` (#149)
 - `PartitionName` and `GPTPartitionEntry` are `Copy`, and `Debug` for `PartitionName` prints the name rather than its 36 code units (#150)
+- Add `GPT::write_into_file` to write to a `std::fs::File` and call `sync_data()` after each copy (#137)
+- Add `GPT::write_into_with_barrier` to write to any writer with a custom durability barrier (#137)
 
 Fixed:
 
@@ -34,6 +37,7 @@ Fixed:
 - `PartitionName::from` kept a name longer than 36 UTF-16 code units whole while writing only the first 36 to disk, so `as_str` could report a name the disk never holds. The name is now truncated to the 36 code units that are written (#150)
 - The test module tripped `clippy::precedence` on an expression that shifted before it masked, which the lint job of the MSRV build reports as an error. The expression sat in a loop sampling code units that the exhaustive test below it already covers, so the loop went with it (#150)
 - Test that a partition name whose bytes after the null terminator hold garbage survives a rewrite, which is the case parted and GParted produce when they rename a partition, and the one issue #142 was about (#150)
+- Fix `GPT::write_into` possibly leaving the disk with no valid partition table if the write is interrupted: the copy of the GPT that was not read is now written first and the writer is flushed after each copy (#137)
 
 ## v3.1.1 (2026-04-28)
 
