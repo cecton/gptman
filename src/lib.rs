@@ -102,11 +102,12 @@ where
     Ok(writer.write_all(&buf)?)
 }
 
-fn decode_from_std_read<T>(mut src: impl Read) -> Result<T>
+// NOTE: `len` is the size of `T` on the disk, which is not the size of `T` in memory.
+fn decode_from_std_read<T>(mut src: impl Read, len: usize) -> Result<T>
 where
     T: for<'de> SchemaRead<'de, Dst = T>,
 {
-    let mut buf = vec![0; size_of::<T>()];
+    let mut buf = vec![0; len];
     src.read_exact(&mut buf)?;
     Ok(wincode::deserialize(&buf)?)
 }
@@ -184,7 +185,7 @@ impl GPTHeader {
     where
         R: Read + Seek + ?Sized,
     {
-        let gpt: GPTHeader = decode_from_std_read(reader)?;
+        let gpt: GPTHeader = decode_from_std_read(reader, 92)?;
 
         if &gpt.signature != b"EFI PART" {
             return Err(Error::InvalidSignature);
@@ -208,8 +209,8 @@ impl GPTHeader {
 
     /// Read and validate the partition entry array that belongs to this header.
     ///
-    /// Seeks to each partition entry using `partition_entry_lba` and `sector_size`, reads all
-    /// entries, then verifies `partition_entry_array_crc32`.
+    /// Seeks to the partition entry array using `partition_entry_lba` and `sector_size`, reads
+    /// all the sectors it spans in a single read, then verifies `partition_entry_array_crc32`.
     pub fn read_partitions<R>(
         &self,
         reader: &mut R,
@@ -218,14 +219,20 @@ impl GPTHeader {
     where
         R: Read + Seek + ?Sized,
     {
-        let mut partitions = Vec::with_capacity(self.number_of_partition_entries as usize);
-        for i in 0..self.number_of_partition_entries {
-            reader.seek(SeekFrom::Start(
-                self.partition_entry_lba * sector_size
-                    + u64::from(i) * u64::from(self.size_of_partition_entry),
-            ))?;
-            partitions.push(GPTPartitionEntry::read_from(reader)?);
-        }
+        let size = self.size_of_partition_entry as usize;
+        let len = (self.number_of_partition_entries as usize)
+            .checked_mul(size)
+            .ok_or(Error::Overflow)?;
+        let sectors_len = len
+            .checked_next_multiple_of(sector_size as usize)
+            .ok_or(Error::Overflow)?;
+        let mut buf = vec![0; sectors_len];
+        reader.seek(SeekFrom::Start(self.partition_entry_lba * sector_size))?;
+        reader.read_exact(&mut buf)?;
+
+        let partitions = (0..self.number_of_partition_entries as usize)
+            .map(|i| GPTPartitionEntry::read_from(&mut &buf[i * size..(i + 1) * size]))
+            .collect::<Result<Vec<_>>>()?;
         let sum = self.generate_partition_entry_array_crc32(&partitions);
         if self.partition_entry_array_crc32 != sum {
             return Err(Error::InvalidPartitionEntryArrayChecksum(
@@ -549,7 +556,7 @@ impl GPTPartitionEntry {
     where
         R: Read + ?Sized,
     {
-        decode_from_std_read(reader)
+        decode_from_std_read(reader, 128)
     }
 
     /// Returns `true` if the partition entry is not used (type GUID == `[0; 16]`)
@@ -724,6 +731,8 @@ impl GPT {
     /// The field `last_usable_lba` on the header is not updated to reflect the actual size of the
     /// disk. You must do this yourself by calling `update_from`.
     ///
+    /// Only whole sectors are read, starting at a sector boundary.
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -741,7 +750,9 @@ impl GPT {
 
         let primary: Result<(GPTHeader, Vec<GPTPartitionEntry>)> = (|| {
             reader.seek(SeekFrom::Start(sector_size))?;
-            let header = GPTHeader::read_from(&mut reader)?;
+            let mut sector = vec![0; sector_size as usize];
+            reader.read_exact(&mut sector)?;
+            let header = GPTHeader::read_from(&mut io::Cursor::new(sector))?;
             let partitions = header.read_partitions(&mut reader, sector_size)?;
             Ok((header, partitions))
         })();
@@ -753,8 +764,12 @@ impl GPT {
             }
 
             reader.seek(SeekFrom::Start((len / sector_size - 1) * sector_size))?;
+            let mut sector = vec![0; sector_size as usize];
 
-            GPTHeader::read_from(&mut reader)
+            reader
+                .read_exact(&mut sector)
+                .map_err(Error::from)
+                .and_then(|()| GPTHeader::read_from(&mut io::Cursor::new(sector)))
                 .and_then(|header| {
                     let partitions = header.read_partitions(&mut reader, sector_size)?;
                     Ok((header, partitions))
@@ -1543,6 +1558,74 @@ mod test {
     }
 
     #[test]
+    fn read_header_and_partition_entry_of_exact_size() {
+        let data = fs::read(DISK1).unwrap();
+        let gpt = GPT::read_from(&mut io::Cursor::new(&data), 512).unwrap();
+
+        let header = GPTHeader::read_from(&mut io::Cursor::new(&data[512..512 + 92])).unwrap();
+        assert_eq!(header, gpt.header);
+        let partition = GPTPartitionEntry::read_from(&mut &data[1024..1024 + 128]).unwrap();
+        assert_eq!(partition, gpt[1]);
+    }
+
+    // A reader that refuses to read anything else than whole sectors, like the disks of some
+    // operating systems do.
+    struct WholeSectors {
+        cur: io::Cursor<Vec<u8>>,
+        sector_size: u64,
+    }
+
+    impl WholeSectors {
+        fn new(data: Vec<u8>, sector_size: u64) -> WholeSectors {
+            WholeSectors {
+                cur: io::Cursor::new(data),
+                sector_size,
+            }
+        }
+    }
+
+    impl Read for WholeSectors {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.cur.position() % self.sector_size != 0
+                || buf.len() as u64 % self.sector_size != 0
+            {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            self.cur.read(buf)
+        }
+    }
+
+    impl Seek for WholeSectors {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.cur.seek(pos)
+        }
+    }
+
+    #[test]
+    fn read_whole_sectors() {
+        fn test(path: &str, ss: u64) {
+            let mut data = fs::read(path).unwrap();
+            let gpt = GPT::read_from(&mut io::Cursor::new(&data), ss).unwrap();
+
+            let mut reader = WholeSectors::new(data.clone(), ss);
+            assert_eq!(GPT::read_from(&mut reader, ss).unwrap(), gpt);
+
+            // from the backup header
+            data[ss as usize] = 0;
+            let mut reader = WholeSectors::new(data, ss);
+            let backup = GPT::read_from(&mut reader, ss).unwrap();
+            assert!(backup.is_backup());
+            assert_eq!(backup[1], gpt[1]);
+        }
+
+        test(DISK1, 512);
+        test(DISK2, 4096);
+
+        let mut reader = WholeSectors::new(fs::read(DISK1).unwrap(), 512);
+        assert_eq!(GPT::find_from(&mut reader).unwrap().sector_size, 512);
+    }
+
+    #[test]
     fn find_backup() {
         fn test(path: &str, ss: u64) {
             let mut cur = io::Cursor::new(fs::read(path).unwrap());
@@ -2180,8 +2263,8 @@ mod test {
             }
 
             cur.seek(SeekFrom::Start(446 + 8)).unwrap();
-            let first_lba: u32 = decode_from_std_read(&mut cur).unwrap();
-            let sectors: u32 = decode_from_std_read(&mut cur).unwrap();
+            let first_lba: u32 = decode_from_std_read(&mut cur, 4).unwrap();
+            let sectors: u32 = decode_from_std_read(&mut cur, 4).unwrap();
             assert_eq!(first_lba, 1);
             assert_eq!(sectors, 99);
         }
