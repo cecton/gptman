@@ -2229,6 +2229,52 @@ mod test {
     }
 
     #[test]
+    fn write_zeroes_the_padding_after_the_entry_array() {
+        // NOTE: with the default 128 entries the array is 16 KiB, a whole number of sectors for
+        //       every power-of-two sector size up to 16 KiB, so `write_zeroes_reserved_bytes` never
+        //       sees a padded tail. With 130 entries the array has a padded tail at 512-byte
+        //       sectors, and UEFI requires those bytes to be zero just as it does the ones after
+        //       the header.
+        let ss = 512;
+        let mut cur = io::Cursor::new(vec![0xff; 200 * ss as usize]);
+        let mut gpt = GPT::new_from(&mut cur, ss, [0xff; 16]).unwrap();
+        while gpt.partitions.len() < 130 {
+            gpt.partitions.push(GPTPartitionEntry::empty());
+        }
+        gpt.header.number_of_partition_entries = 130;
+        // NOTE: the layout depends on the size of the array, recompute it like a caller would
+        gpt.header.update_from(&mut cur, ss).unwrap();
+        let backup = gpt.write_into(&mut cur).unwrap();
+
+        let data = cur.into_inner();
+        let len: usize = 130 * 128;
+        let padded = len.next_multiple_of(ss as usize);
+        assert!(
+            padded > len,
+            "the array has to have a padded tail to test it"
+        );
+        for lba in [gpt.header.partition_entry_lba, backup.partition_entry_lba] {
+            let start = (lba * ss) as usize;
+            assert!(data[start + len..start + padded].iter().all(|x| *x == 0));
+        }
+        // the primary copy is read on its own: `GPT::read_from` would fall back to the backup copy
+        // if the primary one were broken, and the test would pass without checking it
+        let mut cur = io::Cursor::new(&data);
+        cur.seek(SeekFrom::Start(ss)).unwrap();
+        let primary = GPTHeader::read_from(&mut cur).unwrap();
+        assert!(primary.read_partitions(&mut cur, ss).is_ok());
+
+        // the backup copy is whole too: its array does not run into its header
+        let last_lba = data.len() as u64 / ss - 1;
+        assert_eq!(backup.primary_lba, last_lba);
+        cur.seek(SeekFrom::Start(last_lba * ss)).unwrap();
+        let header = GPTHeader::read_from(&mut cur).unwrap();
+        assert_eq!(header.number_of_partition_entries, 130);
+        assert_eq!(header.partition_entry_lba, backup.partition_entry_lba);
+        assert!(header.read_partitions(&mut cur, ss).is_ok());
+    }
+
+    #[test]
     fn write_with_barrier() {
         fn test(path: &str, ss: u64) {
             let mut rec = Recorder::new(fs::read(path).unwrap());
