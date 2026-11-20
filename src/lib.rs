@@ -418,7 +418,12 @@ impl GPTHeader {
         sector_size: u64,
         partitions: &[GPTPartitionEntry],
     ) -> Result<[(u64, Vec<u8>); 2]> {
-        let sector_size_bytes = sector_size as usize;
+        // NOTE: a sector size of zero would divide by zero in `next_multiple_of` below, and the
+        //       caller of a raw `GPTHeader::write_into` is free to pass one.
+        if sector_size == 0 {
+            return Err(Error::Overflow);
+        }
+        let sector_size_bytes = usize::try_from(sector_size).map_err(|_| Error::Overflow)?;
 
         let mut entries = Vec::with_capacity(
             self.number_of_partition_entries as usize * self.size_of_partition_entry as usize,
@@ -432,8 +437,18 @@ impl GPTHeader {
         header.resize(sector_size_bytes, 0);
 
         Ok([
-            (self.partition_entry_lba * sector_size, entries),
-            (self.primary_lba * sector_size, header),
+            (
+                self.partition_entry_lba
+                    .checked_mul(sector_size)
+                    .ok_or(Error::Overflow)?,
+                entries,
+            ),
+            (
+                self.primary_lba
+                    .checked_mul(sector_size)
+                    .ok_or(Error::Overflow)?,
+                header,
+            ),
         ])
     }
 
@@ -2277,6 +2292,42 @@ mod test {
 
         test(DISK1, 512);
         test(DISK2, 4096);
+    }
+
+    #[test]
+    fn write_into_rejects_a_sector_size_of_zero() {
+        // NOTE: `next_multiple_of` divides by the sector size, so a zero one panicked in the
+        //       padding of `chunks` instead of returning an error.
+        let mut cur = io::Cursor::new(vec![0; 100 * 512]);
+        let mut gpt = GPT::new_from(&mut cur, 512, [0xff; 16]).unwrap();
+
+        match gpt.header.write_into(&mut cur, 0, &gpt.partitions.clone()) {
+            Err(Error::Overflow) => {}
+            x => panic!("unexpected result: {x:?}"),
+        }
+    }
+
+    #[test]
+    fn write_into_rejects_an_overflowing_lba() {
+        // NOTE: the byte offsets used to be computed with a plain multiplication, which panics in
+        //       debug and wraps in release: a wrapped offset silently writes the table somewhere
+        //       else on the disk instead of failing. `main` returned `Err(Overflow)` for both.
+        for (sector_size, lba) in [(512u64, u64::MAX / 2), (32, 1u64 << 59)] {
+            let mut cur = io::Cursor::new(vec![0; 100 * 512]);
+            let mut gpt = GPT::new_from(&mut cur, 512, [0xff; 16]).unwrap();
+            gpt.header.partition_entry_lba = lba;
+            gpt.header.update_crc32_checksum();
+
+            let before = cur.get_ref().clone();
+            match gpt
+                .header
+                .write_into(&mut cur, sector_size, &gpt.partitions.clone())
+            {
+                Err(Error::Overflow) => {}
+                x => panic!("unexpected result for {sector_size}/{lba}: {x:?}"),
+            }
+            assert_eq!(cur.get_ref(), &before, "the disk was written to");
+        }
     }
 
     #[test]
