@@ -11,6 +11,7 @@ Breaking changes:
 - A truncated header or partition entry now returns `Error::Io` with `UnexpectedEof` (#149)
 - Remove `PartitionName::as_str`, which has no replacement: a `&str` cannot borrow into `[u16; 36]`, so use `Display`, `to_string` or `format!` to print a name (#150)
 - `PartitionName` no longer holds a `String`; it keeps the 36 UTF-16LE code units of the name alone (#150)
+- Sector sizes that are not a power of two of at least 512 bytes are now rejected with `Error::InvalidSectorSize` by every function that takes one, and by the `GPT` methods that use its `sector_size` field. A zero sector size used to panic, and a sector smaller than the 92-byte header silently wrote a truncated one
 
 Changed:
 
@@ -26,6 +27,7 @@ Added:
 
 - `GPTHeader::from_bytes`/`to_bytes` over `&[u8; 92]`, `GPTPartitionEntry::from_bytes`/`to_bytes` over `&[u8; 128]` and `PartitionName::from_bytes`/`to_bytes` over `&[u8; 72]` (#149)
 - `Error::InvalidPartitionEntrySize`, `Error::InvalidPartitionEntryArraySize` and `Error::InvalidPartitionEntryCount` (#149)
+- `Error::InvalidSectorSize`
 - `PartitionName` and `GPTPartitionEntry` are `Copy`, and `Debug` for `PartitionName` prints the name rather than its 36 code units (#150)
 - Add `GPT::write_into_file` to write to a `std::fs::File` and call `sync_data()` after each copy (#137)
 - Add `GPT::write_into_with_barrier` to write to any writer with a custom durability barrier (#137)

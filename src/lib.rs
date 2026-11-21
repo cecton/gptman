@@ -81,6 +81,10 @@ pub enum Error {
     PartitionNotFound,
     /// An arithmetic operation overflowed.
     Overflow,
+    /// The sector size is not a power of two of at least 512 bytes.
+    ///
+    /// The argument is the sector size (in bytes) that was given.
+    InvalidSectorSize(u64),
 }
 
 impl core::fmt::Display for Error {
@@ -125,6 +129,7 @@ impl core::fmt::Display for Error {
             Error::UnusedPartition => f.write_str("unused partition"),
             Error::PartitionNotFound => f.write_str("partition not found"),
             Error::Overflow => f.write_str("an arithmetic operation overflowed"),
+            Error::InvalidSectorSize(size) => write!(f, "invalid sector size: {size}"),
         }
     }
 }
@@ -185,6 +190,11 @@ pub struct GPTHeader {
 
 impl GPTHeader {
     /// Make a new GPT header based on a reader. (This operation does not write anything to disk!)
+    ///
+    /// # Errors
+    ///
+    /// The sector size has to be a power of two of at least 512 bytes, or
+    /// [`Error::InvalidSectorSize`] is returned.
     pub fn new_from<R>(reader: &mut R, sector_size: u64, disk_guid: [u8; 16]) -> Result<GPTHeader>
     where
         R: Read + Seek,
@@ -314,8 +324,13 @@ impl GPTHeader {
     /// Read and validate the partition entry array that belongs to this header.
     ///
     /// Seeks the reader to the array with `partition_entry_lba` and `sector_size`, reads the
-    /// entries a sector at a time (one entry at a time when a sector is smaller than an entry),
-    /// then verifies `partition_entry_array_crc32` against the bytes read.
+    /// entries a sector at a time, then verifies `partition_entry_array_crc32` against the bytes
+    /// read.
+    ///
+    /// # Errors
+    ///
+    /// The sector size has to be a power of two of at least 512 bytes, or
+    /// [`Error::InvalidSectorSize`] is returned.
     pub fn read_partitions<R>(
         &self,
         reader: &mut R,
@@ -324,6 +339,7 @@ impl GPTHeader {
     where
         R: Read + Seek + ?Sized,
     {
+        let sector_size_bytes = check_sector_size(sector_size)?;
         self.check_partition_entry_array()?;
 
         reader.seek(SeekFrom::Start(
@@ -336,13 +352,12 @@ impl GPTHeader {
         //       memory as a whole: only the partitions themselves are kept. Reading a single
         //       entry at a time instead would issue one read call per entry, which is 128 of them
         //       for the usual table and three times slower on a real file. The buffer holds the
-        //       entries that make up a sector (a single entry when a sector is smaller than an
-        //       entry), or the whole array when that is smaller, so it stays bounded by the array
-        //       size rather than by the sector size the caller gives.
+        //       entries that make up a sector, or the whole array when that is smaller, so it stays
+        //       bounded by the array size rather than by the sector size the caller gives.
         const ENTRY_SIZE: usize = 128;
 
         let total = self.number_of_partition_entries as usize;
-        let entries_per_sector = (sector_size as usize / ENTRY_SIZE).max(1);
+        let entries_per_sector = sector_size_bytes / ENTRY_SIZE;
         let entries_per_read = entries_per_sector.min(total);
         let mut partitions = Vec::with_capacity(total);
         let mut crc = crc32::Crc32::new();
@@ -386,6 +401,9 @@ impl GPTHeader {
     ///
     /// The header has to be one gptman can read back: a size of 92 bytes, a partition entry size
     /// of 128 bytes, and as many partition entries as `number_of_partition_entries`.
+    ///
+    /// The sector size has to be a power of two of at least 512 bytes, or
+    /// [`Error::InvalidSectorSize`] is returned.
     pub fn write_into<W>(
         &mut self,
         writer: &mut W,
@@ -425,12 +443,10 @@ impl GPTHeader {
         sector_size: u64,
         partitions: &[GPTPartitionEntry],
     ) -> Result<[(u64, Vec<u8>); 2]> {
-        // NOTE: a sector size of zero would divide by zero in `next_multiple_of` below, and the
-        //       caller of a raw `GPTHeader::write_into` is free to pass one.
-        if sector_size == 0 {
-            return Err(Error::Overflow);
-        }
-        let sector_size_bytes = usize::try_from(sector_size).map_err(|_| Error::Overflow)?;
+        // NOTE: a sector size of zero would divide by zero in `next_multiple_of` below, and one
+        //       smaller than the header would truncate it, and the caller of a raw
+        //       `GPTHeader::write_into` is free to pass either.
+        let sector_size_bytes = check_sector_size(sector_size)?;
 
         let mut entries = Vec::with_capacity(
             self.number_of_partition_entries as usize * self.size_of_partition_entry as usize,
@@ -521,10 +537,16 @@ impl GPTHeader {
     /// Updates the header to match the disk the seeker is on, reading its size from the end of it.
     /// `first_usable_lba`, `last_usable_lba`, `primary_lba`, `backup_lba`, `partition_entry_lba`
     /// will be updated after this operation.
+    ///
+    /// # Errors
+    ///
+    /// The sector size has to be a power of two of at least 512 bytes, or
+    /// [`Error::InvalidSectorSize`] is returned.
     pub fn update_from<S>(&mut self, seeker: &mut S, sector_size: u64) -> Result<()>
     where
         S: Seek + ?Sized,
     {
+        check_sector_size(sector_size)?;
         let partition_array_size = (u64::from(self.number_of_partition_entries)
             * u64::from(self.size_of_partition_entry)
             - 1)
@@ -563,6 +585,17 @@ impl GPTHeader {
     pub fn is_backup(&self) -> bool {
         !self.is_primary()
     }
+}
+
+// Checks that a sector size is one gptman supports, a power of two of at least 512 bytes, and
+// returns it as a `usize`. Every logical block size in use is one, and it guarantees that a sector
+// holds the 92 bytes of a header and a whole number of 128-byte partition entries.
+fn check_sector_size(sector_size: u64) -> Result<usize> {
+    if sector_size < 512 || !sector_size.is_power_of_two() {
+        return Err(Error::InvalidSectorSize(sector_size));
+    }
+
+    usize::try_from(sector_size).map_err(|_| Error::InvalidSectorSize(sector_size))
 }
 
 // Writes the chunks returned by `GPTHeader::prepare`, in order.
@@ -943,6 +976,11 @@ pub struct GPT {
 impl GPT {
     /// Make a new GPT based on a reader. (This operation does not write anything to disk!)
     ///
+    /// # Errors
+    ///
+    /// The sector size has to be a power of two of at least 512 bytes, or
+    /// [`Error::InvalidSectorSize`] is returned.
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -979,6 +1017,11 @@ impl GPT {
     /// The field `last_usable_lba` on the header is not updated to reflect the actual size of the
     /// disk. You must do this yourself by calling `update_from`.
     ///
+    /// # Errors
+    ///
+    /// The sector size has to be a power of two of at least 512 bytes, or
+    /// [`Error::InvalidSectorSize`] is returned.
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -993,6 +1036,8 @@ impl GPT {
         R: Read + Seek + ?Sized,
     {
         use self::Error::*;
+
+        check_sector_size(sector_size)?;
 
         let primary: Result<(GPTHeader, Vec<GPTPartitionEntry>)> = (|| {
             reader.seek(SeekFrom::Start(sector_size))?;
@@ -1155,6 +1200,9 @@ impl GPT {
     /// * the partitions must not overlap,
     /// * the partitions must fit within the disk.
     ///
+    /// The sector size (the `sector_size` field) has to be a power of two of at least 512 bytes,
+    /// or [`Error::InvalidSectorSize`] is returned.
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -1179,6 +1227,11 @@ impl GPT {
     /// Write the GPT to a file or to a block device. This function does the same as
     /// [`Self::write_into`] but calls [`std::fs::File::sync_data`] after each copy of the GPT has
     /// been written, so the first copy is on the disk before the second one is touched.
+    ///
+    /// # Errors
+    ///
+    /// The sector size has to be a power of two of at least 512 bytes, or
+    /// [`Error::InvalidSectorSize`] is returned.
     ///
     /// # Examples
     ///
@@ -1220,6 +1273,11 @@ impl GPT {
     ///
     /// <div class="warning">The <code>flush</code> of <code>std::fs::File</code> does nothing,
     /// it cannot be used as a barrier. Use <code>sync_data</code> or <code>sync_all</code>.</div>
+    ///
+    /// # Errors
+    ///
+    /// The sector size has to be a power of two of at least 512 bytes, or
+    /// [`Error::InvalidSectorSize`] is returned.
     ///
     /// # Examples
     ///
@@ -1497,6 +1555,9 @@ impl GPT {
     /// the partition is unused, or if the partition's `ending_lba` is less than its
     /// `starting_lba`.
     ///
+    /// The sector size (the `sector_size` field) has to be a power of two of at least 512 bytes,
+    /// or [`Error::InvalidSectorSize`] is returned.
+    ///
     /// # Examples
     ///
     /// ```
@@ -1520,6 +1581,7 @@ impl GPT {
         if partition_number == 0 || partition_number > self.header.number_of_partition_entries {
             return Err(Error::InvalidPartitionNumber(partition_number));
         }
+        check_sector_size(self.sector_size)?;
         let partition = &self[partition_number];
 
         let sector_range = partition.range()?;
@@ -1602,6 +1664,11 @@ impl GPT {
     /// starting at byte 446 and ending at byte 511. Any existing data will be overwritten.
     ///
     /// See also: [`Self::write_bootable_protective_mbr_into`].
+    ///
+    /// # Errors
+    ///
+    /// The sector size has to be a power of two of at least 512 bytes, or
+    /// [`Error::InvalidSectorSize`] is returned.
     pub fn write_protective_mbr_into<W>(mut writer: &mut W, sector_size: u64) -> Result<()>
     where
         W: Write + Seek + ?Sized,
@@ -1619,6 +1686,11 @@ impl GPT {
     /// <div class="warning">Some systems will not consider a disk to be bootable in UEFI mode
     /// if the pMBR is marked as bootable, so this should only be used if booting on legacy BIOS
     /// systems is a requirement.</div>
+    ///
+    /// # Errors
+    ///
+    /// The sector size has to be a power of two of at least 512 bytes, or
+    /// [`Error::InvalidSectorSize`] is returned.
     pub fn write_bootable_protective_mbr_into<W>(mut writer: &mut W, sector_size: u64) -> Result<()>
     where
         W: Write + Seek + ?Sized,
@@ -1634,6 +1706,7 @@ impl GPT {
     where
         W: Write + Seek + ?Sized,
     {
+        check_sector_size(sector_size)?;
         let size = writer.seek(SeekFrom::End(0))? / sector_size - 1;
         writer.seek(SeekFrom::Start(446))?;
         // partition 1
@@ -2371,9 +2444,58 @@ mod test {
         let mut gpt = GPT::new_from(&mut cur, 512, [0xff; 16]).unwrap();
 
         match gpt.header.write_into(&mut cur, 0, &gpt.partitions.clone()) {
-            Err(Error::Overflow) => {}
+            Err(Error::InvalidSectorSize(0)) => {}
             x => panic!("unexpected result: {x:?}"),
         }
+    }
+
+    #[test]
+    fn invalid_sector_sizes_are_rejected() {
+        // NOTE: every logical block size in use is a power of two of at least 512 bytes. Zero
+        //       used to divide by zero, and the other values are sizes no device has.
+        for ss in [0u64, 256, 511, 513, 1536] {
+            let mut cur = io::Cursor::new(vec![0; 100 * 512]);
+            match GPT::new_from(&mut cur, ss, [0xff; 16]) {
+                Err(Error::InvalidSectorSize(x)) if x == ss => {}
+                x => panic!("unexpected result for new_from with {ss}: {x:?}"),
+            }
+
+            let mut f = fs::File::open(DISK1).unwrap();
+            match GPT::read_from(&mut f, ss) {
+                Err(Error::InvalidSectorSize(x)) if x == ss => {}
+                x => panic!("unexpected result for read_from with {ss}: {x:?}"),
+            }
+
+            f.seek(SeekFrom::Start(512)).unwrap();
+            let header = GPTHeader::read_from(&mut f).unwrap();
+            match header.read_partitions(&mut f, ss) {
+                Err(Error::InvalidSectorSize(x)) if x == ss => {}
+                x => panic!("unexpected result for read_partitions with {ss}: {x:?}"),
+            }
+
+            let before = cur.get_ref().clone();
+            match GPT::write_protective_mbr_into(&mut cur, ss) {
+                Err(Error::InvalidSectorSize(x)) if x == ss => {}
+                x => panic!("unexpected result for write_protective_mbr_into with {ss}: {x:?}"),
+            }
+            assert_eq!(cur.get_ref(), &before, "the disk was written to");
+        }
+    }
+
+    #[test]
+    fn gpt_write_into_rejects_a_sector_size_changed_after_construction() {
+        // NOTE: `sector_size` is a public field, so it has to be checked where it is used and not
+        //       only when the GPT is made.
+        let mut cur = io::Cursor::new(vec![0; 100 * 512]);
+        let mut gpt = GPT::new_from(&mut cur, 512, [0xff; 16]).unwrap();
+        gpt.sector_size = 0;
+
+        let before = cur.get_ref().clone();
+        match gpt.write_into(&mut cur) {
+            Err(Error::InvalidSectorSize(0)) => {}
+            x => panic!("unexpected result: {x:?}"),
+        }
+        assert_eq!(cur.get_ref(), &before, "the disk was written to");
     }
 
     #[test]
@@ -2381,7 +2503,7 @@ mod test {
         // NOTE: the byte offsets used to be computed with a plain multiplication, which panics in
         //       debug and wraps in release: a wrapped offset silently writes the table somewhere
         //       else on the disk instead of failing. `main` returned `Err(Overflow)` for both.
-        for (sector_size, lba) in [(512u64, u64::MAX / 2), (32, 1u64 << 59)] {
+        for (sector_size, lba) in [(512u64, u64::MAX / 2), (4096, 1u64 << 53)] {
             let mut cur = io::Cursor::new(vec![0; 100 * 512]);
             let mut gpt = GPT::new_from(&mut cur, 512, [0xff; 16]).unwrap();
             gpt.header.partition_entry_lba = lba;
@@ -2846,7 +2968,7 @@ mod test {
     }
 
     #[test]
-    fn read_partitions_in_sectors_of_any_size() {
+    fn read_partitions_in_sectors_of_each_supported_size() {
         // NOTE: the array is read a sector at a time, so the last read is a partial one whenever
         //       the number of entries is not a multiple of the entries per sector.
         for (ss, count) in [
@@ -2856,7 +2978,7 @@ mod test {
             (4096, 128),      // 32 entries per sector, exact
             (4096, 33),       // 32 entries per sector, 1 left over
             (512, 256),       // twice the usual table, 64 reads
-            (96, 8),          // a sector smaller than an entry
+            (2048, 130),      // 16 entries per sector, 2 left over
         ] {
             let entry = GPTPartitionEntry {
                 attribute_bits: 0,
