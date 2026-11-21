@@ -395,6 +395,18 @@ impl GPTHeader {
     where
         W: Write + Seek + ?Sized,
     {
+        let chunks = self.prepare(sector_size, partitions)?;
+        write_chunks(writer, &chunks)
+    }
+
+    // Checks that this copy of the GPT can be written, updates its CRC32 checksums and returns the
+    // chunks to write (see `chunks`). Nothing is written, so a caller writing several copies can
+    // prepare all of them before touching the disk.
+    fn prepare(
+        &mut self,
+        sector_size: u64,
+        partitions: &[GPTPartitionEntry],
+    ) -> Result<[(u64, Vec<u8>); 2]> {
         if self.header_size != 92 {
             return Err(Error::InvalidHeaderSize);
         }
@@ -402,12 +414,7 @@ impl GPTHeader {
         self.update_partition_entry_array_crc32(partitions)?;
         self.update_crc32_checksum();
 
-        for (offset, data) in self.chunks(sector_size, partitions)? {
-            writer.seek(SeekFrom::Start(offset))?;
-            writer.write_all(&data)?;
-        }
-
-        Ok(())
+        self.chunks(sector_size, partitions)
     }
 
     // Returns the data to write for this copy of the GPT as (offset in bytes, data), in the order
@@ -556,6 +563,19 @@ impl GPTHeader {
     pub fn is_backup(&self) -> bool {
         !self.is_primary()
     }
+}
+
+// Writes the chunks returned by `GPTHeader::prepare`, in order.
+fn write_chunks<W>(writer: &mut W, chunks: &[(u64, Vec<u8>)]) -> Result<()>
+where
+    W: Write + Seek + ?Sized,
+{
+    for (offset, data) in chunks {
+        writer.seek(SeekFrom::Start(*offset))?;
+        writer.write_all(data)?;
+    }
+
+    Ok(())
 }
 
 /// A partition's name.
@@ -1247,10 +1267,13 @@ impl GPT {
         // NOTE: the copy that has been read is known to be valid, the other one has never been
         //       checked. The latter is written first so there is always a valid copy on the disk
         //       if the write is interrupted.
-        backup.write_into(&mut writer, self.sector_size, &self.partitions)?;
+        //       Both copies are prepared before anything is written, so an error in either of
+        //       them leaves the disk untouched.
+        let backup_chunks = backup.prepare(self.sector_size, &self.partitions)?;
+        let primary_chunks = self.header.prepare(self.sector_size, &self.partitions)?;
+        write_chunks(&mut writer, &backup_chunks)?;
         barrier(writer)?;
-        self.header
-            .write_into(&mut writer, self.sector_size, &self.partitions)?;
+        write_chunks(&mut writer, &primary_chunks)?;
         barrier(writer)?;
 
         Ok(backup)
@@ -2374,6 +2397,23 @@ mod test {
             }
             assert_eq!(cur.get_ref(), &before, "the disk was written to");
         }
+    }
+
+    #[test]
+    fn gpt_write_into_validates_both_copies_before_writing() {
+        // NOTE: the backup copy used to be written, and the barrier passed, before the offsets of
+        //       the primary copy were computed: an overflowing primary LBA returned an error after
+        //       the disk had been changed.
+        let mut cur = io::Cursor::new(vec![0; 100 * 512]);
+        let mut gpt = GPT::new_from(&mut cur, 512, [0xff; 16]).unwrap();
+        gpt.header.primary_lba = u64::MAX / 2;
+
+        let before = cur.get_ref().clone();
+        match gpt.write_into(&mut cur) {
+            Err(Error::Overflow) => {}
+            x => panic!("unexpected result: {x:?}"),
+        }
+        assert_eq!(cur.get_ref(), &before, "the disk was written to");
     }
 
     #[test]
