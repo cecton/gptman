@@ -2256,8 +2256,8 @@ mod test {
         // NOTE: with the default 128 entries the array is 16 KiB, a whole number of sectors for
         //       every power-of-two sector size up to 16 KiB, so `write_zeroes_reserved_bytes` never
         //       sees a padded tail. With 130 entries the array has a padded tail at 512-byte
-        //       sectors, and UEFI requires those bytes to be zero just as it does the ones after
-        //       the header.
+        //       sectors. UEFI reserves those bytes and does not cover them with the entry array
+        //       CRC; gptman zeroes them like the reserved bytes after the header.
         let ss = 512;
         let mut cur = io::Cursor::new(vec![0xff; 200 * ss as usize]);
         let mut gpt = GPT::new_from(&mut cur, ss, [0xff; 16]).unwrap();
